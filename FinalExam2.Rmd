@@ -1,0 +1,281 @@
+---
+title: "Econ294A R programming final"
+author: "Feng Hong"
+date: "March 17, 2016"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(Rcpp)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+library(class)
+library(nycflights13)  #for data
+library("RSQLite") #for sqllite
+nycflights13_sqlite()
+```
+
+## Extract Data from Database
+```{r raw, message=FALSE}
+flights_sqlite <- tbl(nycflights13_sqlite(), "flights")
+airlines_sqlite <- tbl(nycflights13_sqlite(), "airlines")
+airports_sqlite <- tbl(nycflights13_sqlite(), "airports")
+planes_sqlite <- tbl(nycflights13_sqlite(), "planes")
+weather_sqlite <- tbl(nycflights13_sqlite(), "weather")
+```
+
+## Join the table *flights* and *planes*
+```{r flights_planes_join, message=FALSE}
+inner_flights_planes <- inner_join(flights, planes, by = "tailnum") %>% tbl_df 
+names(inner_flights_planes)
+colnames(inner_flights_planes)[1] <- "flight_year"
+colnames(inner_flights_planes)[15] <- "dep_hour"
+colnames(inner_flights_planes)[17] <- "plane_year"
+```
+
+## Create the date index
+```{r data_index_creation}
+flights_planes <- inner_flights_planes %>% 
+  mutate(
+    date = paste(flight_year, month, day, sep = "-"), 
+    date = as.Date(date, format = "%Y-%m-%d"), # create date to merge with weather
+    cancelled = ifelse(is.na(arr_time), 1, 0)  # question requires this
+  ) 
+```
+
+## Change character variable to factor variable
+```{r select_columns}
+flights_planes$carrier <- as.factor(flights_planes$carrier)
+flights_planes$origin <- as.factor(flights_planes$origin)
+flights_planes$dest <- as.factor(flights_planes$dest)
+flights_planes$manufacturer <- as.factor(flights_planes$manufacturer)
+```
+
+## Change integer variable to factor variable
+``` {r type_conversion}
+flights_planes$month <- as.factor(flights_planes$month)
+flights_planes$flight <- as.factor(flights_planes$flight)
+```
+
+
+## Weather Data Refinement
+```{r weather1}
+weather <- weather_sqlite %>%  
+  collect() %>% 
+  mutate(
+    date = paste(year, month, day, sep = "-"),
+    date = as.Date(date, format = "%Y-%m-%d"),
+    weekday = weekdays(date),
+    weekday = as.factor(weekday) # add the weekday variable
+  ) 
+```
+
+
+```{r weather2}
+weather_mean <- weather %>% group_by(date) %>%
+  summarise(
+    weekday = first(weekday),
+    mean_temp = mean(temp),
+    mean_dewp = mean(dewp),
+    mean_humid = mean(humid),
+    # mean_wind_dir = mean(wind_dir), wind direction has too many NA's.
+    mean_wind_speed = mean(wind_speed),
+    mean_wind_gust = mean(wind_gust),
+    mean_precip = mean(precip),
+    # mean_pressure = mean(pressure), pressure has too many NA's.
+    mean_visib = mean(visib)
+  )
+```
+
+
+## Identify the highly correlated data
+```{r correlated_data}
+corr_weather_mean <- cor(na.omit(weather_mean[,3:9]))
+print(corr_weather_mean)
+```
+
+## Delete columns that are highly correlated from weather_mean
+```{r data_delete}
+weather2 <- weather_mean %>%
+  dplyr::select(date, weekday, mean_temp, mean_wind_speed, mean_precip, mean_visib)
+corr_weather2<- cor(na.omit(weather2[,3:6]))
+print(corr_weather2)
+```
+
+## Join flights, planes and weather data and obtain the final data
+```{r final_data}
+final_data <- inner_join(flights_planes, weather2, by = "date")
+length(final_data[final_data$cancelled == 1])
+names(final_data)
+```
+
+
+## **OLS** for *dep_delay*
+```
+I expect the following regressors to be significant. Some similar variables 
+such as mean_temp, mean_wind_speed are not included as arguments mostly because
+their impact on departure delay can be ambiguous. 
+```
+
+```{r OLS}
+model.delay <- lm(dep_delay ~ month + as.factor(weekday) + carrier + origin +
+                plane_year + seats + mean_precip + mean_visib,
+               data = final_data)
+summary(model.delay)
+```
+
+```
+From the regression we can see that dummy variables "month" and "carrier" are
+generally significant regressor. "Weekday, "origin, "plane_year", "seats",
+"mean_precip", "mean_visib" are all significant. The coefficients stated in the
+regression results.
+However, the model has an Adjusted R-squared as small as 0.05242. So based on
+this model, we might not be able to predict the departure delay precisely.
+```
+
+
+## **GLS** for *cancel*
+```
+For regression of cancellation, use logit model because "cancelled" is a binary
+variable.
+```
+
+```{r GLS}
+model.cancel <- glm(cancelled ~ month + as.factor(weekday) + carrier + origin +
+                     seats +  mean_visib,
+                   data = final_data, family=binomial(link="logit"))
+summary(model.cancel)
+```
+
+```
+I’ve tried several other regressors, which all turned out to be insignificant. 
+In this particular model above, the factors chosen are almost all significant,
+the coefficients stated in the regression results.
+Using this model, we can predict the probability of cancellation based on the
+independent variabls.
+```
+
+```
+I'm also interested in how different weather conditions would affect the daily
+mean cancellation. So I find daily total cancellation and keep weather variables
+to run the regression.  
+```
+
+```{r time, Warning=FALSE}
+total_cancel_by_date <- final_data %>% group_by(date) %>% 
+  summarise(cancel_total = sum(cancelled),
+            mean_temp = mean(mean_temp, na.rm = T),
+            mean_wind_speed = mean(mean_wind_speed, na.rm = T),
+            mean_precip = mean(mean_precip, na.rm = T),
+            mean_visib = mean(mean_visib, na.rm = T)) 
+
+model.total_cancel <- lm(cancel_total ~ mean_temp + mean_wind_speed + 
+                           mean_precip + mean_visib, 
+                         data = total_cancel_by_date)
+summary(model.total_cancel)
+
+```
+
+```
+The independent variable mean_wind_speed and mean_visib are both significant.
+Using this model we can predict how many cancellations might occur based on
+weather conditions. But again, adjusted r-squared is not high enough to justify
+the model.
+```
+
+## Plotting with ggplot2
+# (a) weather
+
+```{r plot_a}
+plot_weather <- ggplot(data = final_data, aes(mean_precip, mean_visib)) 
+plot_weather + geom_point( aes(color = as.factor(cancelled)),size = 1) +
+  xlab("Precipitation") + ylab("Visibility")
+```
+
+```
+The plot shows a simple relationship between cancellation and 2 major weather
+conditions: visibility and precipitation. As we can see for most sunny clear
+days, cancellation relatively rarely happens.
+```
+
+# (b) day of week and time of year
+```{r plot_b}
+month_weekday <- final_data %>%
+  group_by(month, weekday) %>%
+  summarise(mean.dep_delay = mean(dep_delay, na.rm = T)) 
+
+plot_time <- ggplot(month_weekday, aes(x = month, y= mean.dep_delay))
+plot_time + geom_point(aes(color = weekday), size = 3) +
+  xlab("Month") + ylab("Departure Delay")
+```
+
+```
+This picture gives us an idea of the pattern of departure delay with respect to
+weekday for each month. Weekend flights seem to have less departure delay.
+```
+# (c) airport destination
+
+```{r plot_c}
+plot_destination <- ggplot(data = final_data, aes(month, dep_delay, color = distance)) 
+plot_destination + geom_point() +
+  xlab("Month") + ylab("Departure Delay")
+```
+
+
+# (d) characteristics of the plane
+```{r plot_d}
+plot_plane <- ggplot(data = final_data, aes(x = seats, y = dep_delay, 
+                                            color = engines, shape = type))
+plot_plane + geom_point(alpha=0.2) +
+  xlab("Month") + ylab("Departure Delay")
+```
+
+```
+The last picture here shows the relationship between engine number, plane type
+and departure delay for each month.
+```
+
+
+## Try some data mining - Based on KNN
+```
+Got the error message:
+Error in knn(train = knn_train, test = knn_test, cl = knn_train_target,  : 
+'train' and 'class' have different lengths
+
+Have to give up due to limit of time     
+KNN reference: https://www.youtube.com/watch?v=DkLNb0CXw84
+```
+```{r KNN, eval=FALSE}
+table(final_data$cancelled)
+set.seed(9850)
+gp <- runif(nrow(final_data))
+
+final_data_knn <- final_data[order(gp),]
+
+# DEBUG:
+# str(final_data_knn)
+# summary(final_data_knn)
+
+knn_no_na <- final_data_knn[(!is.na(final_data_knn$mean_temp)) & 
+                    (!is.na(final_data_knn$mean_wind_speed)) & 
+                    (!is.na(final_data_knn$mean_precip)) & 
+                    (!is.na(final_data_knn$mean_visib)),]
+
+normalize <- function(x){ return( (x- min(x))/(max(x) - min(x)) ) }
+knn_normal <- as.data.frame(lapply(knn_no_na[, c(28,29,30,31)], normalize))
+summary(knn_normal)
+
+
+knn_train <- knn_normal[1:250000,]
+knn_test <- knn_normal[250001:281860,]
+
+# DEBUG:
+# names(knn_no_na)
+knn_train_target <- knn_no_na[1:250000, 26]
+knn_test_target <-knn_no_na[250001:281860, 26]
+
+k = 500
+m1 <- knn(train = knn_train, test = knn_test, cl=knn_train_target, k =500)
+
+```
